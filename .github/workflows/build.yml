@@ -70,7 +70,7 @@ jobs:
           DP: ${{ steps.plugins.outputs.docker_proxy_sha }}
           FORCE: ${{ inputs.force }}
         run: |
-          key="caddy-${VERSION}-cf-${CF}-l4-${L4}-dp-${DP}"
+          key="caddy-${VERSION}-cf-${CF:0:12}-l4-${L4:0:12}-dp-${DP:0:12}"
           echo "key=$key" >> "$GITHUB_OUTPUT"
           if [ "$FORCE" = "true" ]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
