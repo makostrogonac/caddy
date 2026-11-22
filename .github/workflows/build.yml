@@ -1,0 +1,141 @@
+name: Build caddy
+
+# Rebuilds whenever caddyserver/caddy publishes a new stable release, or a
+# plugin's default branch moves. Daily schedule; manual dispatch forces a build.
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Build even if nothing changed
+        type: boolean
+        default: true
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - .github/workflows/build.yml
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/caddy
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.diff.outputs.changed }}
+      version: ${{ steps.ver.outputs.version }}
+      cloudflare_sha: ${{ steps.plugins.outputs.cloudflare_sha }}
+      l4_sha: ${{ steps.plugins.outputs.l4_sha }}
+      docker_proxy_sha: ${{ steps.plugins.outputs.docker_proxy_sha }}
+      key: ${{ steps.diff.outputs.key }}
+    steps:
+      - name: Latest stable Caddy release
+        id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(gh api repos/caddyserver/caddy/releases/latest --jq .tag_name)
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Plugin branch heads
+        id: plugins
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for p in caddy-dns/cloudflare:cloudflare mholt/caddy-l4:l4 lucaslorentz/caddy-docker-proxy:docker_proxy; do
+            repo=${p%%:*}; name=${p##*:}
+            sha=$(gh api "repos/$repo/commits/master" --jq .sha)
+            echo "${name}_sha=$sha" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compare with last published build
+        id: diff
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          CF: ${{ steps.plugins.outputs.cloudflare_sha }}
+          L4: ${{ steps.plugins.outputs.l4_sha }}
+          DP: ${{ steps.plugins.outputs.docker_proxy_sha }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          key="caddy-${VERSION}-cf-${CF}-l4-${L4}-dp-${DP}"
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+          if [ "$FORCE" = "true" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Forced build: $key"
+          elif docker manifest inspect "$IMAGE:$key" > /dev/null 2>&1; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Already published: $key"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "New build needed: $key"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tags
+        id: meta
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          KEY: ${{ needs.check.outputs.key }}
+        run: |
+          minor=${VERSION%.*}
+          {
+            echo "tags<<EOF"
+            echo "$IMAGE:latest"
+            echo "$IMAGE:$VERSION"
+            echo "$IMAGE:$minor"
+            echo "$IMAGE:$KEY"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          build-args: |
+            CADDY_VERSION=${{ needs.check.outputs.version }}
+            CLOUDFLARE_REF=${{ needs.check.outputs.cloudflare_sha }}
+            L4_REF=${{ needs.check.outputs.l4_sha }}
+            DOCKER_PROXY_REF=${{ needs.check.outputs.docker_proxy_sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Make package public (anonymous pulls)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh api --method PATCH "user/packages/container/caddy" -f visibility=public; then
+            echo "Package is public."
+          else
+            echo "::warning::Could not set visibility via API. One-time manual step: GitHub → Packages → caddy → Package settings → Change visibility → Public."
+          fi
