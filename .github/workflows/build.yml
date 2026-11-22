@@ -139,3 +139,32 @@ jobs:
           else
             echo "::warning::Could not set visibility via API. One-time manual step: GitHub → Packages → caddy → Package settings → Change visibility → Public."
           fi
+
+  # GitHub disables scheduled workflows in public repos after 60 days without
+  # repo activity. This repo otherwise gets no commits between Caddy releases,
+  # so the daily check commits a timestamp at most once every 45 days. The file
+  # is outside the push-trigger paths, so this never starts a build.
+  keepalive:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - name: Commit a check timestamp when the last one is over 45 days old
+        run: |
+          now=$(date +%s)
+          last=0
+          if [ -f .github/last-check ]; then
+            last=$(date -d "$(cat .github/last-check)" +%s 2>/dev/null || echo 0)
+          fi
+          if [ $((now - last)) -lt $((45 * 86400)) ]; then
+            echo "Last keepalive commit is recent; nothing to do."
+            exit 0
+          fi
+          date -u +%Y-%m-%dT%H:%M:%SZ > .github/last-check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/last-check
+          git commit -m "keepalive: scheduled build check ran"
+          git push
